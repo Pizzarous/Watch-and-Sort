@@ -103,14 +103,14 @@ def create_example_rules(path):
             {
                 "source": "D:/downloads",
                 "match_keywords": ["succession"],
-                "destination": "/media/TV/Succession",
+                "destination": "S:/media/TV/Succession",
                 "rename_format": "Succession - S{season:02d}E{episode:02d}",
                 "season": 1,
             },
             {
                 "source": "D:/downloads/Animated",
                 "match_keywords": ["arcane", "s2"],
-                "destination": "/media/TV/Arcane",
+                "destination": "S:/media/TV/Arcane",
                 "rename_format": "Arcane - S{season:02d}E{episode:02d}",
                 "season": 2,
             },
