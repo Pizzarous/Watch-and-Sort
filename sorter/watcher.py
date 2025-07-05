@@ -4,7 +4,9 @@ import shutil
 import sys
 import threading
 import time
+from threading import Lock
 
+from tqdm import tqdm
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
@@ -26,13 +28,23 @@ def get_base_path():
         )
 
 
-def wait_for_file_complete(filepath, wait_time=3, retries=100):
+def wait_for_file_accessible(filepath, wait_time=30, retries=10):
+    for _ in range(retries):
+        try:
+            with open(filepath, "rb"):
+                return True
+        except (PermissionError, IOError):
+            time.sleep(wait_time)
+    return False
+
+
+def wait_for_file_complete(filepath, wait_time=30, retries=10):
     previous_size = -1
     for _ in range(retries):
         try:
             current_size = os.path.getsize(filepath)
         except FileNotFoundError:
-            return False  # file disappeared
+            return False
         if current_size == previous_size and current_size > 0:
             return True
         previous_size = current_size
@@ -40,61 +52,107 @@ def wait_for_file_complete(filepath, wait_time=3, retries=100):
     return False
 
 
+def copy_with_progress(src, dst):
+    total_size = os.path.getsize(src)
+    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        with tqdm(
+            total=total_size,
+            unit="B",
+            unit_scale=True,
+            desc=os.path.basename(src),
+            leave=True,
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+        ) as pbar:
+            while True:
+                buf = fsrc.read(1024 * 1024)  #
+                if not buf:
+                    break
+                fdst.write(buf)
+                pbar.update(len(buf))
+    shutil.copystat(src, dst)
+
+
 class SortHandler(FileSystemEventHandler):
     def __init__(self, rules):
         self.rules = rules
+        self.processed_files = set()
+        self.lock = Lock()
+        self.manual_scan_in_progress = False
 
     def process_file(self, filepath):
-        filename = os.path.basename(filepath)
-        if filename.endswith((".part", ".!qb", ".crdownload")):
-            return False
+        filepath = os.path.abspath(filepath)
+        with self.lock:
+            if filepath in self.processed_files:
+                print(f"⏩ Already processed: {os.path.basename(filepath)}")
+                return False
+        try:
+            filename = os.path.basename(filepath)
 
-        if not wait_for_file_complete(filepath):
-            print(f"File not ready yet: {filename}")
-            return False
+            if filename.endswith((".part", ".!qb", ".crdownload")):
+                print(f"⏸️ Skipping temporary file: {filename}")
+                return False
 
-        rule = find_matching_rule(filename, self.rules)
-        if rule and filepath.startswith(rule["source"]):
-            dest_folder = rule["destination"]
-            os.makedirs(dest_folder, exist_ok=True)
+            if not wait_for_file_accessible(filepath):
+                print(f"🔒 File locked or inaccessible: {filename}")
+                return False
 
-            # Use season from the rule, default to 1 if missing
-            season_num = rule.get("season", 1)
+            if not wait_for_file_complete(filepath):
+                print(f"⏳ File not ready yet: {filename}")
+                return False
 
-            episode_num = get_next_episode_number(dest_folder)
+            rule = find_matching_rule(filename, self.rules)
+            if rule and os.path.normpath(filepath).startswith(
+                os.path.normpath(rule["source"])
+            ):
+                dest_folder = rule["destination"]
+                os.makedirs(dest_folder, exist_ok=True)
 
-            new_name = generate_new_filename(filename, rule, season_num, episode_num)
-            dest_path = os.path.join(dest_folder, new_name)
+                season_num = rule.get("season", 1)
+                episode_num = get_next_episode_number(dest_folder)
+                new_name = generate_new_filename(
+                    filename, rule, season_num, episode_num
+                )
+                dest_path = os.path.join(dest_folder, new_name)
 
-            shutil.copy2(filepath, dest_path)
-            print(f"Copied: {filename} -> {dest_path}")
-            return True
-        else:
-            print(f"Ignored or unmatched: {filename}")
+                copy_with_progress(filepath, dest_path)
+                print(f"✅ Copied: {filename} → {os.path.basename(dest_path)}")
+                print(f"   📁 Destination: {dest_path}\n")
+
+                with self.lock:
+                    self.processed_files.add(filepath)  # add here after success
+                return True
+            else:
+                print(f"❌ No matching rule found: {filename}")
+                return False
+
+        except Exception as e:
+            print(f"Error processing file {filepath}: {e}")
             return False
 
     def on_created(self, event):
         if not event.is_directory:
-            self.process_file(event.src_path)
+            try:
+                with self.lock:
+                    if self.manual_scan_in_progress:
+                        return
+                print(f"📄 New file detected: {os.path.basename(event.src_path)}")
+                self.process_file(event.src_path)
+            except Exception as e:
+                print(f"❌ Error processing {event.src_path}: {e}")
 
-
-def clear_console():
-    os.system("cls" if os.name == "nt" else "clear")
-
-
-def process_all_existing_files(rules):
-    print("Running manual scan on all watched folders...")
-    for rule in rules:
-        source = rule["source"]
-        if not os.path.isdir(source):
-            print(f"Source folder does not exist: {source}")
-            continue
-        for filename in os.listdir(source):
-            filepath = os.path.join(source, filename)
-            if os.path.isfile(filepath):
-                handler = SortHandler(rules)
-                handler.process_file(filepath)
-    print("Manual scan complete.")
+    def on_modified(self, event):
+        if not event.is_directory:
+            try:
+                with self.lock:
+                    if self.manual_scan_in_progress:
+                        return
+                # Only show modification message if file isn't already processed
+                filepath_abs = os.path.abspath(event.src_path)
+                if filepath_abs not in self.processed_files:
+                    print(f"📝 File modified: {os.path.basename(event.src_path)}")
+                self.process_file(event.src_path)
+            except Exception as e:
+                print(f"❌ Error processing modified file {event.src_path}: {e}")
 
 
 def create_example_rules(path):
@@ -133,7 +191,6 @@ def start_watching():
         return
 
     rules = load_rules(config_path)
-
     if not rules:
         print(
             "Warning: No rules found in rules.json. The program will not process any files."
@@ -141,37 +198,96 @@ def start_watching():
         return
 
     observer = Observer()
+    handlers = {}
     watched_paths = set()
 
     for rule in rules:
         source = rule.get("source")
         if not source or not os.path.isdir(source):
             print(f"⚠️  Source folder does not exist or is invalid: {source}")
-            continue  # skip this rule
+            continue
 
         if "destination" not in rule:
             print(f"⚠️  Missing 'destination' in rule: {rule}")
             continue
 
-        if source not in watched_paths:
+        if source not in handlers:
+            source_rules = [r for r in rules if r.get("source") == source]
+            handler = SortHandler(source_rules)
+            handlers[source] = handler
+            observer.schedule(handler, path=source, recursive=False)
             watched_paths.add(source)
-            observer.schedule(SortHandler(rules), path=source, recursive=False)
-            print(f"Watching: {source}")
+            print(f"👀 Watching: {source}")
 
     observer.start()
+    print(f"\n🚀 File sorter started! Monitoring {len(watched_paths)} folder(s).")
+
+    def manual_scan():
+        print("🔍 Running manual scan on all watched folders...")
+        files_processed = 0
+        files_skipped = 0
+
+        # Set flag to prevent file system events during manual scan
+        for handler in handlers.values():
+            with handler.lock:
+                handler.manual_scan_in_progress = True
+
+        try:
+            for source, handler in handlers.items():
+                if not os.path.isdir(source):
+                    print(f"❌ Source folder does not exist: {source}")
+                    continue
+
+                print(f"\n📂 Scanning: {source}")
+                files_in_directory = os.listdir(source)
+                print(f"   Found {len(files_in_directory)} items")
+
+                for filename in files_in_directory:
+                    filepath = os.path.join(source, filename)
+                    if os.path.isfile(filepath):
+                        print(f"   📄 {filename}")
+
+                        # Check if already processed before attempting to process
+                        filepath_abs = os.path.abspath(filepath)
+                        with handler.lock:
+                            if filepath_abs in handler.processed_files:
+                                print(f"      ⏩ Already processed, skipping")
+                                files_skipped += 1
+                                continue
+
+                        # Only process if not already processed
+                        result = handler.process_file(filepath)
+                        if result:
+                            files_processed += 1
+                        else:
+                            print(f"      ❌ Skipped or failed")
+                    else:
+                        print(f"   📁 {filename} (directory - skipped)")
+
+        finally:
+            # Reset flag after manual scan completes
+            for handler in handlers.values():
+                with handler.lock:
+                    handler.manual_scan_in_progress = False
+
+        print(f"\n📊 Manual scan complete!")
+        print(f"   ✅ Processed: {files_processed} files")
+        print(f"   ⏩ Skipped: {files_skipped} files\n")
 
     def listen_for_key():
-        print("Press ENTER to run manual scan on all files. Ctrl+C to exit.")
+        print("\n⌨️  Press ENTER to run manual scan on all files. Ctrl+C to exit.")
         while True:
             try:
                 input()
-                process_all_existing_files(rules)
-                time.sleep(10)  # wait a few seconds
-                clear_console()
+                manual_scan()
+                print("👀 Resuming automatic file monitoring...")
                 for path in watched_paths:
-                    print(f"Watching: {path}")
-                print("Press ENTER to run manual scan on all files. Ctrl+C to exit.")
+                    print(f"   📂 {path}")
+                print(
+                    "\n⌨️  Press ENTER to run manual scan on all files. Ctrl+C to exit."
+                )
             except KeyboardInterrupt:
+                print("\n👋 Stopping file sorter...")
                 observer.stop()
                 break
 
